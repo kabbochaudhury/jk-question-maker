@@ -1,0 +1,28 @@
+-- JK Question Maker: Supabase PostgreSQL schema
+create extension if not exists pgcrypto;
+create type public.member_role as enum ('admin','member');
+create table public.profiles(id uuid primary key references auth.users(id) on delete cascade, display_name text not null default 'Member', role public.member_role not null default 'member', created_at timestamptz not null default now());
+create table public.groups(id uuid primary key default gen_random_uuid(), name text not null, owner_id uuid not null references public.profiles(id), invite_code text unique not null default upper(substr(encode(gen_random_bytes(8),'hex'),1,10)), created_at timestamptz not null default now());
+create table public.group_members(group_id uuid references public.groups(id) on delete cascade, user_id uuid references public.profiles(id) on delete cascade, role public.member_role not null default 'member', joined_at timestamptz not null default now(), primary key(group_id,user_id));
+create table public.quizzes(id uuid primary key default gen_random_uuid(), title text not null, description text default '', code char(6) unique not null, creator_id uuid not null references public.profiles(id), group_id uuid references public.groups(id) on delete set null, duration_minutes int not null default 20 check(duration_minutes between 1 and 300), negative_marking numeric(5,2) not null default 0 check(negative_marking>=0), is_public boolean not null default true, published boolean not null default false, created_at timestamptz not null default now());
+create table public.questions(id uuid primary key default gen_random_uuid(), quiz_id uuid not null references public.quizzes(id) on delete cascade, position int not null, question_text text not null, image_url text, options jsonb not null check(jsonb_typeof(options)='array' and jsonb_array_length(options)=4), correct_index int not null check(correct_index between 0 and 3), explanation text default '', points numeric(6,2) not null default 1, unique(quiz_id,position));
+create table public.submissions(id uuid primary key default gen_random_uuid(), quiz_id uuid not null references public.quizzes(id) on delete cascade, participant_name text not null, participant_roll text default '', answers jsonb not null default '{}', score numeric(8,2) not null default 0, time_taken_seconds int not null default 0, submitted_at timestamptz not null default now());
+create index submissions_rank_idx on public.submissions(quiz_id,score desc,time_taken_seconds asc,submitted_at asc);
+create or replace function public.make_quiz_code() returns trigger language plpgsql as $$ declare candidate text; begin if new.code is null or new.code='000000' then loop candidate:=lpad((floor(random()*1000000))::int::text,6,'0'); exit when not exists(select 1 from public.quizzes where code=candidate); end loop; new.code:=candidate; end if; return new; end $$;
+create trigger quiz_code_before_insert before insert on public.quizzes for each row execute function public.make_quiz_code();
+-- RLS: public quiz metadata/questions readable only when published; owners/group members can manage.
+alter table public.profiles enable row level security; alter table public.groups enable row level security; alter table public.group_members enable row level security; alter table public.quizzes enable row level security; alter table public.questions enable row level security; alter table public.submissions enable row level security;
+create policy "profiles self read/update" on public.profiles for select using(auth.uid()=id);
+create policy "profile self insert" on public.profiles for insert with check(auth.uid()=id);
+create policy "groups members read" on public.groups for select using(owner_id=auth.uid() or exists(select 1 from public.group_members gm where gm.group_id=id and gm.user_id=auth.uid()));
+create policy "group owner create" on public.groups for insert with check(owner_id=auth.uid());
+create policy "group owner update" on public.groups for update using(owner_id=auth.uid()) with check(owner_id=auth.uid());
+create policy "members read own membership" on public.group_members for select using(user_id=auth.uid() or exists(select 1 from public.groups g where g.id=group_id and g.owner_id=auth.uid()));
+create policy "quiz read published or owner" on public.quizzes for select using(published and is_public or creator_id=auth.uid() or exists(select 1 from public.group_members gm where gm.group_id=group_id and gm.user_id=auth.uid()));
+create policy "creator creates quiz" on public.quizzes for insert with check(creator_id=auth.uid());
+create policy "creator updates quiz" on public.quizzes for update using(creator_id=auth.uid()) with check(creator_id=auth.uid());
+create policy "questions visible with quiz" on public.questions for select using(exists(select 1 from public.quizzes q where q.id=quiz_id and (q.published and q.is_public or q.creator_id=auth.uid())));
+create policy "quiz creator manages questions" on public.questions for all using(exists(select 1 from public.quizzes q where q.id=quiz_id and q.creator_id=auth.uid())) with check(exists(select 1 from public.quizzes q where q.id=quiz_id and q.creator_id=auth.uid()));
+-- Production note: submit scoring must run in a trusted server/Edge Function; do not expose correct_index to examinees before submission.
+create policy "participant submissions insert" on public.submissions for insert with check(exists(select 1 from public.quizzes q where q.id=quiz_id and q.published));
+create policy "quiz creator reads submissions" on public.submissions for select using(exists(select 1 from public.quizzes q where q.id=quiz_id and q.creator_id=auth.uid()));
